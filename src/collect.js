@@ -1,8 +1,8 @@
 // Couche COLLECTE : déterministe, 0 token LLM.
 import Parser from "rss-parser";
-import { RSS_SOURCES, GOOGLE_NEWS_QUERIES, GITHUB_REPOS, HN_QUERIES } from "./sources.js";
+import { RSS_SOURCES, GOOGLE_NEWS_QUERIES, GITHUB_REPOS, GITHUB_TRENDING, HN_QUERIES } from "./sources.js";
 
-const parser = new Parser({ timeout: 15000 });
+const parser = new Parser({ timeout: 15000, headers: { "User-Agent": "Mozilla/5.0 (ai-weekly-digest)" } });
 const WINDOW_DAYS = Number(process.env.WINDOW_DAYS || 7);
 const SINCE = Date.now() - WINDOW_DAYS * 24 * 60 * 60 * 1000;
 const UA = "ai-weekly-digest/1.0 (personal automation)";
@@ -14,13 +14,23 @@ async function collectRss() {
   const out = [];
   for (const s of RSS_SOURCES) {
     try {
-      const feed = await parser.parseURL(s.url);
+      // Reddit répond 429 aux requêtes rapprochées : un second essai après une pause suffit
+      const feed = await parser.parseURL(s.url).catch(async (e) => {
+        if (!/429/.test(e.message)) throw e;
+        await new Promise((r) => setTimeout(r, 8000));
+        return parser.parseURL(s.url);
+      });
+      let n = 0;
       for (const item of feed.items || []) {
         const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
         if (!recent(ts)) continue;
+        if (s.max && n++ >= s.max) break;
+        // newsletters : les outils cités sont dans le corps du numéro, pas dans son titre
+        const body = s.long ? clip(item["content:encoded"] || item.content || item.contentSnippet, 2500)
+          : clip(item.contentSnippet || item.content);
         out.push({ title: item.title || "(sans titre)", url: item.link, source: s.name,
           category: s.category, date: new Date(ts).toISOString(),
-          summary: clip(item.contentSnippet || item.content), score: s.lowPriority ? 1 : 5 });
+          summary: body, score: s.lowPriority ? 1 : 5 });
       }
     } catch (e) { console.warn(`[rss] ${s.name} échec: ${e.message}`); }
   }
@@ -65,6 +75,28 @@ async function collectGithub() {
       }
     } catch (e) { console.warn(`[github] ${r.repo} échec: ${e.message}`); }
   }
+  return out;
+}
+
+// Pas d'API ni de flux pour GitHub Trending : on lit la page.
+async function collectGithubTrending() {
+  const out = [];
+  try {
+    const res = await fetch(GITHUB_TRENDING.url, { headers: { "User-Agent": UA } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    const rows = html.split('<article class="Box-row">').slice(1, GITHUB_TRENDING.max + 1);
+    for (const row of rows) {
+      const repo = (row.match(/<h2[\s\S]*?href="\/([^"\/]+\/[^"\/]+)"/) || [])[1];
+      if (!repo) continue;
+      const desc = clip((row.match(/<p class="col-9[^"]*">([\s\S]*?)<\/p>/) || [])[1], 220);
+      const stars = Number(((row.match(/([\d,]+) stars this week/) || [])[1] || "0").replace(/,/g, ""));
+      // le nombre d'étoiles va dans le résumé : dans le titre, les mots communs feraient fusionner tous les projets
+      out.push({ title: repo, url: `https://github.com/${repo}`,
+        source: "GitHub Trending (semaine)", category: GITHUB_TRENDING.category, date: new Date().toISOString(),
+        summary: `+${stars} étoiles cette semaine. ${desc}`, score: Math.min(10, 4 + Math.floor(stars / 2000)) });
+    }
+  } catch (e) { console.warn(`[trending] échec: ${e.message}`); }
   return out;
 }
 
@@ -147,13 +179,13 @@ function selectByQuota(items, cap, quotas) {
 }
 
 export async function collectAll() {
-  const batches = await Promise.all([collectRss(), collectGoogleNews(), collectGithub(), collectHn()]);
+  const batches = await Promise.all([collectRss(), collectGoogleNews(), collectGithub(), collectGithubTrending(), collectHn()]);
   const items = clusterAndBoost(batches.flat());
-  const CAP = Number(process.env.MAX_ITEMS || 120);
+  const CAP = Number(process.env.MAX_ITEMS || 150);
   const byCat = {};
   for (const it of items) byCat[it.category] = (byCat[it.category] || 0) + 1;
   const topCorro = [...items].sort((a, b) => (b.corroboration || 1) - (a.corroboration || 1))[0];
-  console.log(`[collect] ${items.length} sujets uniques — ia:${byCat.ia || 0} media:${byCat.media || 0} design:${byCat.design || 0} (cap ${CAP})`);
+  console.log(`[collect] ${items.length} sujets uniques — ia:${byCat.ia || 0} media:${byCat.media || 0} design:${byCat.design || 0} outils:${byCat.outils || 0} (cap ${CAP})`);
   if (topCorro) console.log(`[collect] sujet le + corroboré : "${(topCorro.title || "").slice(0, 60)}" (${topCorro.corroboration} sources)`);
-  return selectByQuota(items, CAP, { media: 18, design: 12, ia: 999 });
+  return selectByQuota(items, CAP, { outils: 35, media: 18, design: 12, ia: 999 });
 }

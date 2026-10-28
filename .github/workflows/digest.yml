@@ -2,16 +2,19 @@ name: weekly-digest
 
 on:
   schedule:
-    # 05:00 UTC le samedi ≈ 07:00 Paris (été) / 06:00 (hiver). Ajuste si besoin.
-    - cron: "0 5 * * 6"
+    # lundi 05:00 UTC = 6 h à Paris l'hiver, 7 h l'été
+    - cron: "0 5 * * 1"
   workflow_dispatch: # bouton "Run workflow" pour tester à la demande
 
 permissions:
   contents: write # committer le digest + la page
 
+concurrency: digest
+
 jobs:
   digest:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -21,29 +24,39 @@ jobs:
 
       - run: npm ci || npm install
 
-      # 1) Génère le Markdown + la page HTML (n'envoie rien)
-      - name: Build digest
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CURATION_MODEL: claude-opus-4-8
-        run: npm run build
+      - run: npm install -g @anthropic-ai/claude-code
 
-      # 2) Publie (Pages sert le dossier docs/ sur la branche main)
+      # Même chaîne que run.sh : collecte -> rédaction par Claude Code (abonnement, pas de clé API) -> page
+      - name: Collecte
+        run: node src/run-collect.js
+
+      - name: Redaction
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          DATE="$(date -u +%F)"
+          claude -p "La date du jour est $DATE. Lis items.json et genere le digest de la semaine en suivant CLAUDE.md. Ecris digests/$DATE.md et digests/.latest.json." \
+            --allowedTools "Read,Write" --permission-mode acceptEdits
+          test -s "digests/$DATE.md" && test -s digests/.latest.json
+
+      - name: Page
+        run: DIGEST_DATE="$(date -u +%F)" node src/run-render.js
+
+      # Pages sert le dossier docs/ de main
       - name: Commit & push
         run: |
           git config user.name "digest-bot"
           git config user.email "actions@github.com"
           git add digests/ docs/
-          git commit -m "digest: $(date -u +%Y-%m-%d)" || echo "rien à committer"
+          git commit -m "digest: $(date -u +%F)" || echo "rien à committer"
           git push
 
-      # 3) Laisse Pages se déployer, puis envoie le teaser WhatsApp avec le lien
       - name: Attendre la publication Pages
-        run: sleep 75
+        run: sleep 90
 
-      - name: Notify WhatsApp
+      - name: WhatsApp
         env:
-          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
-          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
-        run: npm run notify
+          RECIPIENTS_JSON: ${{ secrets.RECIPIENTS_JSON }}
+        run: |
+          printf '%s' "$RECIPIENTS_JSON" > recipients.json
+          node src/notify.js

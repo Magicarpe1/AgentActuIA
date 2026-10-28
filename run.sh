@@ -9,13 +9,19 @@ mkdir -p logs digests docs
 LOG="logs/run-$DATE.log"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== RUN $DATE $(date) ==="
+# Secours : la veille tourne d'abord chez GitHub (lundi 6-7 h). Si elle y a réussi, rien à faire ici.
+git fetch -q origin main 2>/dev/null
+if git cat-file -e "origin/main:digests/$DATE.md" 2>/dev/null; then
+  echo "Digest $DATE déjà fait par GitHub — rien à faire."; git pull -q --ff-only origin main || true; exit 0
+fi
+echo "Digest $DATE absent sur GitHub — le Mac prend le relais."
 node src/run-collect.js || { echo "ECHEC collecte"; exit 1; }
 claude -p "La date du jour est $DATE. Lis items.json et genere le digest de la semaine en suivant CLAUDE.md. Ecris digests/$DATE.md et digests/.latest.json." \
   --allowedTools "Read,Write" \
   --permission-mode acceptEdits || { echo "ECHEC curation Claude Code"; exit 1; }
 node src/run-render.js || { echo "ECHEC rendu"; exit 1; }
 git add digests/ docs/ && git commit -m "digest: $DATE" || echo "(rien a committer)"
-git push || echo "(push echoue - verifier auth git)"
+git pull -q --rebase origin main; git push || echo "(push echoue - verifier auth git)"
 node src/notify.js || echo "(envoi WhatsApp echoue)"
 open "docs/index.html" 2>/dev/null || true
 echo "=== FIN $DATE ==="
