@@ -4,3 +4,4 @@ node_modules/
 digests/.latest.json
 .DS_Store
 recipients.json
+items.json

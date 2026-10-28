@@ -31,7 +31,6 @@ async function collectGoogleNews() {
   const out = [];
   for (const q of GOOGLE_NEWS_QUERIES) {
     try {
-      // when:7d -> Google ne renvoie que les articles récents (sinon tri par pertinence = vieux articles)
       const query = `${q.query} when:${WINDOW_DAYS}d`;
       const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
       const feed = await parser.parseURL(url);
@@ -39,7 +38,7 @@ async function collectGoogleNews() {
       for (const item of feed.items || []) {
         const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
         if (!recent(ts)) continue;
-        if (n++ >= 6) break;
+        if (n++ >= 8) break;
         out.push({ title: item.title || "(sans titre)", url: item.link, source: `Google News · ${q.query}`,
           category: q.category, date: new Date(ts).toISOString(),
           summary: clip(item.contentSnippet || item.content, 160), score: 4 });
@@ -62,7 +61,7 @@ async function collectGithub() {
         if (!recent(ts) || rel.draft) continue;
         out.push({ title: `${r.repo} ${rel.tag_name || rel.name || ""}`.trim(), url: rel.html_url,
           source: `GitHub · ${r.repo}`, category: r.category, date: new Date(ts).toISOString(),
-          summary: clip(rel.body, 220), score: rel.prerelease ? 3 : 6 });
+          summary: clip(rel.body, 220), score: rel.prerelease ? 2 : 4 });
       }
     } catch (e) { console.warn(`[github] ${r.repo} échec: ${e.message}`); }
   }
@@ -74,36 +73,67 @@ async function collectHn() {
   const sinceSec = Math.floor(SINCE / 1000);
   for (const q of HN_QUERIES) {
     try {
-      const url = `https://hn.algolia.com/api/v1/search?tags=story&query=${encodeURIComponent(q.query)}&numericFilters=created_at_i>${sinceSec},points>${q.minPoints}`;
+      // Algolia ne filtre plus sur points -> on filtre la date cote API, les points cote JS.
+      const nf = encodeURIComponent(`created_at_i>${sinceSec}`);
+      const url = `https://hn.algolia.com/api/v1/search?tags=story&hitsPerPage=50&query=${encodeURIComponent(q.query)}&numericFilters=${nf}`;
       const res = await fetch(url, { headers: { "User-Agent": UA } });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       for (const h of data.hits || []) {
+        if ((h.points || 0) < q.minPoints) continue;
         out.push({ title: h.title, url: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
           source: `HN (${h.points} pts)`, category: q.category,
           date: new Date(h.created_at_i * 1000).toISOString(), summary: "",
           score: Math.min(10, 4 + Math.floor(h.points / 150)) });
       }
-    } catch (e) { console.warn(`[hn] "${q.query}" échec: ${e.message}`); }
+    } catch (e) { console.warn(`[hn] "${q.query}" echec: ${e.message}`); }
   }
   return out;
 }
 
-function dedupe(items) {
-  const seen = new Set();
-  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 60);
-  return items.filter((it) => {
-    const key = norm(it.title) || norm(it.url);
-    if (!key || seen.has(key)) return false;
-    seen.add(key); return true;
-  });
+const BOOST = /\b(launch|launches|launched|launching|introduc|unveil|announc|release|released|debut|ships?|now available|open[- ]?source|open[- ]?weight|rolls out|general availability|available now)\b/i;
+const VERSIONY = /\b(GPT-?\d|Claude\s|Gemini\s|Llama\s|Sora\s?\d|v\d+(\.\d+)+|\b\d+B\b)\b/;
+const NOISE = /\b(best|top\s\d|vs\.?|versus|tips|how to|guide|tutorial|review|roundup|alternatives?|cheapest|things you|explained|what is|beginner)\b/i;
+function keywordDelta(title) {
+  let d = 0;
+  if (BOOST.test(title)) d += 3;
+  if (VERSIONY.test(title)) d += 2;
+  if (NOISE.test(title)) d -= 4;
+  return d;
 }
 
-// Quota par rubrique : garantit que chaque section remonte, puis complète au score.
+const STOP = new Set("the a an of to in on for and or with from your you out new now ai model models llm que les des une pour avec sur dans".split(" "));
+function sigTokens(title) {
+  return new Set((title || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((w) => w.length > 3 && !STOP.has(w)));
+}
+function overlap(a, b) { let n = 0; for (const w of a) if (b.has(w)) n++; return n; }
+
+function clusterAndBoost(items) {
+  for (const it of items) it.score += keywordDelta(it.title || "");
+  items.sort((a, b) => b.score - a.score || b.date.localeCompare(a.date));
+  const clusters = [];
+  for (const it of items) {
+    const t = sigTokens(it.title);
+    let best = null, bestOv = 0;
+    for (const c of clusters) {
+      const ov = overlap(t, c.tokens);
+      const ratio = ov / Math.max(1, Math.min(t.size, c.tokens.size));
+      if (ov >= 2 && ratio >= 0.34 && ov > bestOv) { bestOv = ov; best = c; }
+    }
+    if (best) best.count++;
+    else clusters.push({ rep: it, tokens: t, count: 1 });
+  }
+  for (const c of clusters) {
+    c.rep.score += Math.min(8, (c.count - 1) * 2);
+    c.rep.corroboration = c.count;
+  }
+  return clusters.map((c) => c.rep);
+}
+
 function selectByQuota(items, cap, quotas) {
   items.sort((a, b) => b.score - a.score || b.date.localeCompare(a.date));
-  const picked = [];
-  const seen = new Set();
+  const picked = [], seen = new Set();
   for (const cat of Object.keys(quotas)) {
     let n = 0;
     for (const it of items) {
@@ -112,20 +142,18 @@ function selectByQuota(items, cap, quotas) {
       if (++n >= quotas[cat]) break;
     }
   }
-  for (const it of items) {
-    if (picked.length >= cap) break;
-    if (!seen.has(it)) { picked.push(it); seen.add(it); }
-  }
+  for (const it of items) { if (picked.length >= cap) break; if (!seen.has(it)) { picked.push(it); seen.add(it); } }
   return picked.slice(0, cap).sort((a, b) => b.score - a.score || b.date.localeCompare(a.date));
 }
 
 export async function collectAll() {
   const batches = await Promise.all([collectRss(), collectGoogleNews(), collectGithub(), collectHn()]);
-  const items = dedupe(batches.flat());
+  const items = clusterAndBoost(batches.flat());
   const CAP = Number(process.env.MAX_ITEMS || 120);
   const byCat = {};
   for (const it of items) byCat[it.category] = (byCat[it.category] || 0) + 1;
-  console.log(`[collect] ${items.length} items uniques sur ${WINDOW_DAYS}j — ia:${byCat.ia||0} media:${byCat.media||0} design:${byCat.design||0} (cap ${CAP})`);
-  // au moins 18 média et 12 design garantis, le reste au score
+  const topCorro = [...items].sort((a, b) => (b.corroboration || 1) - (a.corroboration || 1))[0];
+  console.log(`[collect] ${items.length} sujets uniques — ia:${byCat.ia || 0} media:${byCat.media || 0} design:${byCat.design || 0} (cap ${CAP})`);
+  if (topCorro) console.log(`[collect] sujet le + corroboré : "${(topCorro.title || "").slice(0, 60)}" (${topCorro.corroboration} sources)`);
   return selectByQuota(items, CAP, { media: 18, design: 12, ia: 999 });
 }
